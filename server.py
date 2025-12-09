@@ -1,103 +1,125 @@
 import socket
 import threading
+import json
+import base64
+import time
+from cryptography.fernet import Fernet
 
+# --- CONFIG ---
 HOST = '127.0.0.1'
 PORT = 55555
+ENCODING = 'utf-8'
+DELIMITER = b'<END>' # Critical for separating messages in the stream
+SYMMETRIC_KEY = b'8co3-4wQfX4Z_N8hG36qXyVj7xXj9L8_gQ5xXj9L8_g=' 
+cipher_suite = Fernet(SYMMETRIC_KEY)
 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind((HOST, PORT))
-server.listen()
-
+# State
 clients = []
-nicknames = []
+client_data = {} # {client_socket: {'nickname': str, 'public_pem': bytes}}
 
-# Registry of all public keys we have received
-# { nickname: "KEY||nickname||<PEM>" (already encrypted) }
-public_key_messages = {}
+def send_packet(client, data_bytes):
+    """Helper to append delimiter and send."""
+    try:
+        client.sendall(data_bytes + DELIMITER)
+    except:
+        remove_client(client)
 
-def broadcast(message, sender_socket=None):
-    """Sends a message to all clients except the sender."""
+def broadcast(data_bytes, sender_socket=None):
+    """Sends data to all except sender."""
     for client in clients:
         if client != sender_socket:
-            try:
-                client.send(message)
-            except:
-                remove(client)
+            send_packet(client, data_bytes)
 
-def remove(client):
-    """Removes a client from the active list."""
+def remove_client(client):
     if client in clients:
-        index = clients.index(client)
-        nickname = nicknames[index]
-
+        nick = client_data[client]['nickname']
         clients.remove(client)
-        nicknames.remove(nickname)
+        del client_data[client]
         client.close()
+        print(f"[SYSTEM] {nick} left.")
+        
+        # Notify others
+        msg = f"SERVER: {nick} left!".encode(ENCODING)
+        # Encrypt the server announcement so clients can parse it uniformly
+        enc_msg = cipher_suite.encrypt(msg)
+        broadcast(enc_msg)
 
-        print(f"{nickname} has left the chat.")
-        broadcast(f"SERVER: {nickname} left!".encode('utf-8'))
-
-def handle(client, nickname):
-    expected_key = False
-
-    while True:
-        try:
-            message = client.recv(8192)
-            if not message:
-                remove(client)
+def handle_client(client):
+    buffer = b""
+    try:
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
                 break
+            buffer += chunk
+            
+            while DELIMITER in buffer:
+                message, buffer = buffer.split(DELIMITER, 1)
+                
+                # Logic to handle specific packet types
+                process_message(client, message)
+    except:
+        pass
+    finally:
+        remove_client(client)
 
-            # If the client sends "PUBKEY", the next encrypted message is their key
-            if message == b"PUBKEY":
-                expected_key = True
-                continue
+def process_message(client, message_bytes):
+    """Decides what to do with a received packet."""
+    
+    # 1. Check if it is a Handshake (Unencrypted JSON)
+    try:
+        # We try to decode as JSON. If it works and has 'public_key_pem', it's a handshake.
+        # If it's garbage or encrypted, this block will fail and go to step 2.
+        data = json.loads(message_bytes.decode(ENCODING))
+        
+        if 'public_key_pem' in data:
+            # IT IS A HANDSHAKE
+            nickname = data['nickname']
+            pub_key = base64.b64decode(data['public_key_pem'])
+            
+            client_data[client] = {'nickname': nickname, 'public_pem': pub_key}
+            clients.append(client)
+            
+            print(f"[Handshake] {nickname} joined.")
+            
+            # A. Send "CONNECTED" signal
+            send_packet(client, b"CONNECTED")
+            
+            # B. Send existing peers' keys (Encrypted Payload)
+            peers = {}
+            for c, d in client_data.items():
+                if c != client:
+                    peers[d['nickname']] = base64.b64encode(d['public_pem']).decode(ENCODING)
+            
+            payload = json.dumps({'type': 'PEERS', 'keys': peers}).encode(ENCODING)
+            enc_payload = cipher_suite.encrypt(payload)
+            send_packet(client, enc_payload)
+            
+            # C. Broadcast NEW_PEER to others (Encrypted Payload)
+            new_peer_payload = json.dumps({
+                'type': 'NEW_PEER', 
+                'nickname': nickname, 
+                'key': data['public_key_pem']
+            }).encode(ENCODING)
+            enc_new_peer = cipher_suite.encrypt(new_peer_payload)
+            broadcast(enc_new_peer, client)
+            return
+            
+    except:
+        pass # Not a handshake, proceed
 
-            if expected_key:
-                # Store the encrypted key packet exactly as-is
-                public_key_messages[nickname] = message
-                expected_key = False
+    # 2. It's a standard encrypted Chat Message
+    # Just relay it to everyone else
+    broadcast(message_bytes, client)
 
-                # Broadcast this key packet to everyone else
-                broadcast(message, client)
-                print(f"[SERVER] Stored and broadcasted key for {nickname}")
-                continue
-
-            # Normal encrypted chat message
-            broadcast(message, client)
-
-        except Exception:
-            remove(client)
-            break
-
-def receive():
-    print(f"Server listening on {HOST}:{PORT}...")
-
+def start():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((HOST, PORT))
+    server.listen()
+    print("Server listening...")
     while True:
-        client, address = server.accept()
-        print(f"Connected with {address}")
-
-        #The server asks “Who are you?” and the client replies with their username.
-        client.send('NICK'.encode('utf-8'))
-        nickname = client.recv(1024).decode('utf-8')
-
-        nicknames.append(nickname)
-        clients.append(client)
-
-        print(f"Nickname is {nickname}")
-
-        # --- NEW: Send all previously known public keys to this newcomer
-        for stored_key_blob in public_key_messages.values():
-            try:
-                client.send(stored_key_blob)
-            except:
-                pass
-
-        broadcast(f"SERVER: {nickname} joined!".encode('utf-8'), client)
-        client.send('Connected to server!'.encode('utf-8'))
-
-        # Start thread
-        thread = threading.Thread(target=handle, args=(client, nickname))
-        thread.start()
+        client, addr = server.accept()
+        threading.Thread(target=handle_client, args=(client,)).start()
 
 if __name__ == "__main__":
-    receive()
+    start()
