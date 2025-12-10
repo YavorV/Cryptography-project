@@ -5,7 +5,7 @@ import base64
 import time
 from cryptography.fernet import Fernet
 
-# --- CONFIG ---
+# CONFIG
 HOST = '127.0.0.1'
 PORT = 55555
 ENCODING = 'utf-8'
